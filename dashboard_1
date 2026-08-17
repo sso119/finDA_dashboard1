@@ -1,0 +1,802 @@
+import React, { useMemo, useState } from "react";
+import {
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  ReferenceLine,
+  ResponsiveContainer,
+} from "recharts";
+
+// ---------------------------------------------------------------------------
+// Design tokens
+// ---------------------------------------------------------------------------
+const C = {
+  bg: "#0A0E13",
+  panel: "#12171F",
+  panelAlt: "#161C25",
+  border: "#232B36",
+  borderSoft: "#1B222B",
+  text: "#E7ECF2",
+  textDim: "#8E99A8",
+  textFaint: "#5D6673",
+  teal: "#33C6A6",
+  tealDim: "#1E5347",
+  amber: "#E3A23D",
+  amberDim: "#4A3A1D",
+  coral: "#E2624F",
+  coralDim: "#4A241E",
+  violet: "#7C86E8",
+  violetDim: "#2B2E52",
+  grid: "#1A2029",
+};
+
+const FONT_MONO =
+  "ui-monospace, SFMono-Regular, 'IBM Plex Mono', Menlo, Consolas, monospace";
+const FONT_SANS =
+  "'Pretendard', -apple-system, 'Apple SD Gothic Neo', 'Segoe UI', sans-serif";
+
+// ---------------------------------------------------------------------------
+// Model reliability table — sourced from RF+P validation summary
+// ---------------------------------------------------------------------------
+const TIERS = {
+  T: {
+    auc: 0.617,
+    precision: 37.2,
+    recall: 95.8,
+    ba: 55.1,
+    tier: "low",
+    tierLabel: "아직 이른 진단",
+    note: "급등 당일이라 정보가 적어요. 참고만 하고 다음 갱신을 기다리세요.",
+  },
+  "T+3": {
+    auc: 0.769,
+    precision: 47.2,
+    recall: 88.5,
+    ba: 68.0,
+    tier: "medium",
+    tierLabel: "참고 신호",
+    note: "정확도가 올라가는 중이지만, 아직 단독으로 판단하기엔 이릅니다.",
+  },
+  "T+5": {
+    auc: 0.778,
+    precision: 52.1,
+    recall: 76.0,
+    ba: 69.5,
+    tier: "high",
+    tierLabel: "믿을 수 있는 조기경보",
+    note: "가장 빠르면서도 안정적으로 맞는 시점이에요. 이후 시점과 정확도 차이도 크지 않아요.",
+  },
+  "T+7": {
+    auc: 0.803,
+    precision: 56.8,
+    recall: 82.3,
+    ba: 74.6,
+    tier: "high",
+    tierLabel: "조기경보",
+    note: "T+5보다 조금 더 정확하지만, 그 차이는 크지 않아요.",
+  },
+  "T+10": {
+    auc: 0.827,
+    precision: 56.3,
+    recall: 79.2,
+    ba: 73.3,
+    tier: "reference",
+    tierLabel: "확인용 (많이 진행됨)",
+    note: "이미 20일 관찰기간의 절반이 지나 결과가 어느 정도 드러난 시점이에요. 새로운 예측이라기보단 확인에 가까워요.",
+  },
+};
+const TIMINGS = ["T", "T+3", "T+5", "T+7", "T+10"];
+
+// 화면에 보여줄 사람 친화적 라벨 + 사건일 기준 날짜
+const TIMING_OFFSET = { T: 0, "T+3": 3, "T+5": 5, "T+7": 7, "T+10": 10 };
+const TIMING_LABEL = {
+  T: "급등일",
+  "T+3": "+3일",
+  "T+5": "+5일",
+  "T+7": "+7일",
+  "T+10": "+10일",
+};
+function dateFor(eventDate, timing) {
+  const d = new Date(eventDate);
+  d.setDate(d.getDate() + TIMING_OFFSET[timing]);
+  return `${d.getMonth() + 1}.${d.getDate()}`;
+}
+
+const TIER_COLOR = {
+  low: { fg: C.textDim, bg: C.borderSoft, dash: "4 3" },
+  medium: { fg: C.amber, bg: C.amberDim, dash: "0" },
+  high: { fg: C.teal, bg: C.tealDim, dash: "0" },
+  reference: { fg: C.violet, bg: C.violetDim, dash: "0" },
+};
+
+// Risk bins (2026 stress test) — used to translate a raw score into an
+// observed base rate, since the model's raw probabilities under-calibrate.
+const RISK_BINS = [
+  { q: "Q1", score: 0.139, actual: 7.1 },
+  { q: "Q2", score: 0.312, actual: 14.5 },
+  { q: "Q3", score: 0.5, actual: 34.5 },
+  { q: "Q4", score: 0.7, actual: 52.7 },
+  { q: "Q5", score: 0.805, actual: 64.3 },
+];
+
+function calibratedRisk(score) {
+  const pts = RISK_BINS;
+  if (score <= pts[0].score) return pts[0].actual;
+  if (score >= pts[pts.length - 1].score) return pts[pts.length - 1].actual;
+  for (let i = 0; i < pts.length - 1; i++) {
+    const a = pts[i],
+      b = pts[i + 1];
+    if (score >= a.score && score <= b.score) {
+      const t = (score - a.score) / (b.score - a.score);
+      return a.actual + t * (b.actual - a.actual);
+    }
+  }
+  return pts[pts.length - 1].actual;
+}
+
+function binOf(score) {
+  const pts = RISK_BINS;
+  for (let i = pts.length - 1; i >= 0; i--) {
+    if (score >= pts[i].score - 0.1) return pts[i].q;
+  }
+  return "Q1";
+}
+
+// ---------------------------------------------------------------------------
+// Mock events — UI 구조 시연용 가상 데이터 (실 서비스에는 모델 산출 스코어 연결)
+// ---------------------------------------------------------------------------
+function buildSeries(seed, drawdownFrom) {
+  const stock = [100];
+  const kospi = [100];
+  let s = 100,
+    k = 100;
+  for (let i = 1; i <= 20; i++) {
+    const noise = Math.sin(i * seed) * 0.6;
+    const drift = i < drawdownFrom ? 1.1 : -0.35;
+    s += drift + noise;
+    k += 0.15 + noise * 0.2;
+    stock.push(Math.round(s * 10) / 10);
+    kospi.push(Math.round(k * 10) / 10);
+  }
+  return stock.map((v, i) => ({ day: i, stock: v, kospi: kospi[i] }));
+}
+
+const EVENTS = [
+  {
+    id: "mirae",
+    name: "미래소재",
+    date: "2026-07-08",
+    return20d: 22.1,
+    volMult: 1.8,
+    scores: { T: 0.24, "T+3": 0.29, "T+5": 0.28, "T+7": 0.27, "T+10": 0.25 },
+    series: buildSeries(0.45, 14),
+  },
+  {
+    id: "hanbit",
+    name: "한빛전자",
+    date: "2026-07-01",
+    return20d: 26.8,
+    volMult: 2.4,
+    scores: { T: 0.52, "T+3": 0.61, "T+5": 0.7, "T+7": 0.78, "T+10": 0.81 },
+    series: buildSeries(0.3, 8),
+  },
+  {
+    id: "saeron",
+    name: "새론바이오",
+    date: "2026-07-11",
+    return20d: 31.4,
+    volMult: 3.1,
+    scores: { T: 0.44, "T+3": 0.55, "T+5": 0.63, "T+7": null, "T+10": null },
+    series: buildSeries(0.6, 10),
+  },
+];
+
+// ---------------------------------------------------------------------------
+// Small building blocks
+// ---------------------------------------------------------------------------
+function Chip({ children, fg, bg, dashed }) {
+  return (
+    <span
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 6,
+        padding: "3px 9px",
+        borderRadius: 999,
+        fontSize: 11,
+        fontWeight: 600,
+        color: fg,
+        background: bg,
+        border: dashed ? `1px dashed ${fg}66` : `1px solid ${fg}33`,
+        letterSpacing: "0.01em",
+      }}
+    >
+      {children}
+    </span>
+  );
+}
+
+function Gauge({ score, tier }) {
+  const risk = calibratedRisk(score);
+  const colors = TIER_COLOR[tier];
+  const r = 54;
+  const c = 2 * Math.PI * r;
+  const pct = Math.min(Math.max(risk / 100, 0), 1);
+  const dashArray = `${c * pct} ${c * (1 - pct)}`;
+  return (
+    <svg width="150" height="150" viewBox="0 0 150 150">
+      <circle
+        cx="75"
+        cy="75"
+        r={r}
+        fill="none"
+        stroke={C.borderSoft}
+        strokeWidth="10"
+      />
+      <circle
+        cx="75"
+        cy="75"
+        r={r}
+        fill="none"
+        stroke={colors.fg}
+        strokeWidth="10"
+        strokeLinecap="round"
+        strokeDasharray={colors.tier === "low" ? undefined : dashArray}
+        strokeDashoffset={c * 0.25}
+        transform="rotate(-90 75 75)"
+        style={{
+          strokeDasharray: dashArray,
+          opacity: tier === "low" ? 0.55 : 1,
+          strokeDashoffset: `${c * 0.25}`,
+        }}
+        strokeDashoffset2=""
+      />
+      <text
+        x="75"
+        y="70"
+        textAnchor="middle"
+        fill={C.text}
+        fontSize="26"
+        fontWeight="700"
+        fontFamily={FONT_MONO}
+      >
+        {risk.toFixed(0)}%
+      </text>
+      <text
+        x="75"
+        y="90"
+        textAnchor="middle"
+        fill={C.textFaint}
+        fontSize="10"
+        fontFamily={FONT_SANS}
+      >
+        환산 실제위험률
+      </text>
+    </svg>
+  );
+}
+
+function ReliabilityBars({ current }) {
+  const max = 0.9;
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
+      {TIMINGS.map((t) => {
+        const d = TIERS[t];
+        const colors = TIER_COLOR[d.tier];
+        const active = t === current;
+        return (
+          <div key={t} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <div
+              style={{
+                width: 36,
+                fontSize: 11,
+                fontFamily: FONT_MONO,
+                color: active ? C.text : C.textFaint,
+                fontWeight: active ? 700 : 400,
+              }}
+            >
+              {t}
+            </div>
+            <div
+              style={{
+                flex: 1,
+                height: 6,
+                background: C.borderSoft,
+                borderRadius: 4,
+                overflow: "hidden",
+              }}
+            >
+              <div
+                style={{
+                  width: `${(d.auc / max) * 100}%`,
+                  height: "100%",
+                  background: active ? colors.fg : `${colors.fg}55`,
+                  borderRadius: 4,
+                }}
+              />
+            </div>
+            <div
+              style={{
+                width: 40,
+                textAlign: "right",
+                fontSize: 11,
+                fontFamily: FONT_MONO,
+                color: active ? C.text : C.textFaint,
+              }}
+            >
+              {d.auc.toFixed(3)}
+            </div>
+          </div>
+        );
+      })}
+      <div style={{ fontSize: 10, color: C.textFaint, marginTop: 2 }}>
+        막대 길이 = 2026 Stress Test ROC-AUC
+      </div>
+    </div>
+  );
+}
+
+function RiskBinStrip({ score }) {
+  const activeQ = binOf(score);
+  return (
+    <div style={{ display: "flex", gap: 4 }}>
+      {RISK_BINS.map((b) => {
+        const active = b.q === activeQ;
+        return (
+          <div
+            key={b.q}
+            style={{
+              flex: 1,
+              padding: "8px 6px",
+              borderRadius: 8,
+              textAlign: "center",
+              background: active ? C.tealDim : C.panelAlt,
+              border: `1px solid ${active ? C.teal : C.borderSoft}`,
+            }}
+          >
+            <div
+              style={{
+                fontSize: 10,
+                color: active ? C.teal : C.textFaint,
+                fontFamily: FONT_MONO,
+                marginBottom: 3,
+              }}
+            >
+              {b.q}
+            </div>
+            <div
+              style={{
+                fontSize: 13,
+                fontFamily: FONT_MONO,
+                fontWeight: 700,
+                color: active ? C.text : C.textDim,
+              }}
+            >
+              {b.actual}%
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Main dashboard
+// ---------------------------------------------------------------------------
+export default function SurgeRiskDashboard() {
+  const [eventId, setEventId] = useState(EVENTS[0].id);
+  const [timing, setTiming] = useState("T+5");
+
+  const event = useMemo(() => EVENTS.find((e) => e.id === eventId), [eventId]);
+  const score = event.scores[timing];
+  const hasScore = score !== null && score !== undefined;
+  const tierMeta = TIERS[timing];
+  const colors = TIER_COLOR[tierMeta.tier];
+  const dayIndex = { T: 0, "T+3": 3, "T+5": 5, "T+7": 7, "T+10": 10 }[timing];
+  const nextTiming =
+    TIMINGS[Math.min(TIMINGS.indexOf(timing) + 1, TIMINGS.length - 1)];
+  const nextDay = { T: 0, "T+3": 3, "T+5": 5, "T+7": 7, "T+10": 10 }[
+    nextTiming
+  ];
+
+  return (
+    <div
+      style={{
+        background: C.bg,
+        color: C.text,
+        fontFamily: FONT_SANS,
+        minHeight: "100%",
+        padding: "28px 24px",
+        boxSizing: "border-box",
+      }}
+    >
+      {/* Header */}
+      <div style={{ marginBottom: 18 }}>
+        <div
+          style={{
+            fontSize: 11,
+            color: C.textFaint,
+            fontFamily: FONT_MONO,
+            marginBottom: 4,
+            letterSpacing: "0.04em",
+          }}
+        >
+          SURGE RISK MONITOR · 화면 예시 · 가상 종목·점수 사용
+        </div>
+        <div style={{ fontSize: 19, fontWeight: 700 }}>
+          급등 이후 과열위험 조기진단
+        </div>
+        <div style={{ fontSize: 12.5, color: C.textDim, marginTop: 2 }}>
+          시점을 바꾸면 T/T+3/T+5/T+7/T+10 모델이 적용되고, 신뢰도가 낮은
+          시점의 진단은 자동으로 톤을 낮춰 표시합니다.
+        </div>
+      </div>
+
+      {/* Selectors */}
+      <div
+        style={{
+          display: "flex",
+          gap: 12,
+          marginBottom: 16,
+          flexWrap: "wrap",
+        }}
+      >
+        <div style={{ flex: "1 1 260px" }}>
+          <div style={{ fontSize: 11, color: C.textFaint, marginBottom: 6 }}>
+            급등 사건
+          </div>
+          <select
+            value={eventId}
+            onChange={(e) => setEventId(e.target.value)}
+            style={{
+              width: "100%",
+              background: C.panel,
+              border: `1px solid ${C.border}`,
+              borderRadius: 8,
+              color: C.text,
+              padding: "9px 10px",
+              fontSize: 13,
+              fontFamily: FONT_SANS,
+            }}
+          >
+            {EVENTS.map((e) => (
+              <option key={e.id} value={e.id}>
+                {e.name} · {e.date}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        <div style={{ flex: "2 1 380px" }}>
+          <div style={{ fontSize: 11, color: C.textFaint, marginBottom: 6 }}>
+            조회 시점
+          </div>
+          <div style={{ display: "flex", gap: 6 }}>
+            {TIMINGS.map((t) => {
+              const meta = TIERS[t];
+              const tc = TIER_COLOR[meta.tier];
+              const active = t === timing;
+              const available =
+                event.scores[t] !== null && event.scores[t] !== undefined;
+              return (
+                <button
+                  key={t}
+                  disabled={!available}
+                  onClick={() => setTiming(t)}
+                  style={{
+                    flex: 1,
+                    padding: "7px 4px",
+                    borderRadius: 8,
+                    border: `1px solid ${active ? tc.fg : C.border}`,
+                    background: active ? tc.bg : C.panel,
+                    color: available ? (active ? tc.fg : C.textDim) : C.textFaint,
+                    fontSize: 12,
+                    fontWeight: active ? 700 : 500,
+                    cursor: available ? "pointer" : "not-allowed",
+                    opacity: available ? 1 : 0.4,
+                    display: "flex",
+                    flexDirection: "column",
+                    alignItems: "center",
+                    gap: 2,
+                  }}
+                >
+                  <span>{TIMING_LABEL[t]}</span>
+                  <span
+                    style={{
+                      fontSize: 10,
+                      fontFamily: FONT_MONO,
+                      color: available ? (active ? tc.fg : C.textFaint) : C.textFaint,
+                      opacity: 0.85,
+                    }}
+                  >
+                    {dateFor(event.date, t)}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+
+      {!hasScore ? (
+        <div
+          style={{
+            background: C.panel,
+            border: `1px solid ${C.border}`,
+            borderRadius: 12,
+            padding: 24,
+            color: C.textDim,
+            fontSize: 13,
+          }}
+        >
+          이 사건은 아직 {timing} 시점에 도달하지 않았습니다. 다음 갱신은{" "}
+          {timing} 시점입니다.
+        </div>
+      ) : (
+        <>
+          {/* Main row: gauge + reliability panel */}
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "minmax(260px, 1fr) minmax(260px, 1fr)",
+              gap: 12,
+              marginBottom: 12,
+            }}
+          >
+            {/* Risk card */}
+            <div
+              style={{
+                background: C.panel,
+                border: `1px solid ${colors.fg}44`,
+                borderRadius: 12,
+                padding: 18,
+                display: "flex",
+                gap: 16,
+                alignItems: "center",
+              }}
+            >
+              <Gauge score={score} tier={tierMeta.tier} />
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <Chip fg={colors.fg} bg={colors.bg} dashed={tierMeta.tier === "low"}>
+                  {tierMeta.tierLabel}
+                </Chip>
+                <div
+                  style={{
+                    fontSize: 12,
+                    color: C.textFaint,
+                    fontFamily: FONT_MONO,
+                    marginTop: 8,
+                  }}
+                >
+                  예측점수 {score.toFixed(2)} · {TIMING_LABEL[timing]}({dateFor(event.date, timing)}) 기준
+                </div>
+                <div style={{ fontSize: 12, color: C.textDim, marginTop: 8, lineHeight: 1.5 }}>
+                  {tierMeta.note}
+                </div>
+              </div>
+            </div>
+
+            {/* Reliability panel */}
+            <div
+              style={{
+                background: C.panel,
+                border: `1px solid ${C.border}`,
+                borderRadius: 12,
+                padding: 18,
+              }}
+            >
+              <div
+                style={{
+                  fontSize: 12,
+                  color: C.textDim,
+                  marginBottom: 10,
+                  fontWeight: 600,
+                }}
+              >
+                시점별 모델 신뢰도 (2026 Stress Test)
+              </div>
+              <ReliabilityBars current={timing} />
+              <div
+                style={{
+                  display: "flex",
+                  gap: 14,
+                  marginTop: 12,
+                  paddingTop: 12,
+                  borderTop: `1px solid ${C.borderSoft}`,
+                  fontFamily: FONT_MONO,
+                  fontSize: 12,
+                }}
+              >
+                <div>
+                  <div style={{ color: C.textFaint, fontSize: 10 }}>Precision</div>
+                  <div style={{ color: C.text }}>{tierMeta.precision}%</div>
+                </div>
+                <div>
+                  <div style={{ color: C.textFaint, fontSize: 10 }}>Recall</div>
+                  <div style={{ color: C.text }}>{tierMeta.recall}%</div>
+                </div>
+                <div>
+                  <div style={{ color: C.textFaint, fontSize: 10 }}>Balanced Acc.</div>
+                  <div style={{ color: C.text }}>{tierMeta.ba}%</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Metrics row */}
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(3, 1fr)",
+              gap: 12,
+              marginBottom: 12,
+            }}
+          >
+            {[
+              ["20일 수익률", `+${event.return20d}%`, "급등 탐지 시점"],
+              ["거래량 배수", `${event.volMult}배`, "직전 20일 평균 대비"],
+              [
+                "다음 갱신",
+                `${TIMING_LABEL[nextTiming]} (${dateFor(event.date, nextTiming)})`,
+                `${nextDay - dayIndex}거래일 후`,
+              ],
+            ].map(([label, value, sub]) => (
+              <div
+                key={label}
+                style={{
+                  background: C.panel,
+                  border: `1px solid ${C.border}`,
+                  borderRadius: 12,
+                  padding: 16,
+                }}
+              >
+                <div style={{ fontSize: 11, color: C.textFaint, marginBottom: 6 }}>
+                  {label}
+                </div>
+                <div
+                  style={{
+                    fontSize: label === "다음 갱신" ? 17 : 22,
+                    fontWeight: 700,
+                    fontFamily: FONT_MONO,
+                    color: C.text,
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {value}
+                </div>
+                <div style={{ fontSize: 11, color: C.textFaint, marginTop: 4 }}>
+                  {sub}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {/* Risk bin context */}
+          <div
+            style={{
+              background: C.panel,
+              border: `1px solid ${C.border}`,
+              borderRadius: 12,
+              padding: 18,
+              marginBottom: 12,
+            }}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 10 }}>
+              <div style={{ fontSize: 12, color: C.textDim, fontWeight: 600 }}>
+                과거 유사 예측점수 구간의 실제 위험률
+              </div>
+              <div style={{ fontSize: 11, color: C.textFaint, fontFamily: FONT_MONO }}>
+                이 사건 → {binOf(score)}
+              </div>
+            </div>
+            <RiskBinStrip score={score} />
+            <div style={{ fontSize: 10.5, color: C.textFaint, marginTop: 10, lineHeight: 1.5 }}>
+              예측점수 자체는 실제 위험률보다 높게 나오는 경향이 있어(calibration
+              보완 필요), 게이지의 %는 원점수가 아니라 이 구간별 실측 위험률로
+              환산한 값입니다.
+            </div>
+          </div>
+
+          {/* Relative performance chart */}
+          <div
+            style={{
+              background: C.panel,
+              border: `1px solid ${C.border}`,
+              borderRadius: 12,
+              padding: 18,
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                marginBottom: 8,
+              }}
+            >
+              <div style={{ fontSize: 12, color: C.textDim, fontWeight: 600 }}>
+                사건일 이후 상대성과
+              </div>
+              <div style={{ display: "flex", gap: 12, fontSize: 11 }}>
+                <span style={{ color: C.teal }}>● 종목</span>
+                <span style={{ color: C.textFaint }}>● KOSPI200</span>
+              </div>
+            </div>
+            <ResponsiveContainer width="100%" height={220}>
+              <LineChart data={event.series} margin={{ top: 6, right: 12, left: -18, bottom: 0 }}>
+                <CartesianGrid stroke={C.grid} vertical={false} />
+                <XAxis
+                  dataKey="day"
+                  tickFormatter={(d) => (d === 0 ? "급등일" : `+${d}일`)}
+                  tick={{ fill: C.textFaint, fontSize: 10 }}
+                  axisLine={{ stroke: C.border }}
+                  tickLine={false}
+                />
+                <YAxis
+                  tick={{ fill: C.textFaint, fontSize: 10 }}
+                  axisLine={false}
+                  tickLine={false}
+                  domain={["auto", "auto"]}
+                />
+                <Tooltip
+                  contentStyle={{
+                    background: C.panelAlt,
+                    border: `1px solid ${C.border}`,
+                    borderRadius: 8,
+                    fontSize: 12,
+                  }}
+                  labelFormatter={(d) => (d === 0 ? "급등일" : `+${d}일`)}
+                />
+                <ReferenceLine
+                  x={dayIndex}
+                  stroke={colors.fg}
+                  strokeDasharray="4 3"
+                  label={{
+                    value: `조회 ${TIMING_LABEL[timing]}`,
+                    position: "top",
+                    fill: colors.fg,
+                    fontSize: 11,
+                  }}
+                />
+                <Line
+                  type="monotone"
+                  dataKey="stock"
+                  stroke={C.teal}
+                  strokeWidth={2.2}
+                  dot={false}
+                />
+                <Line
+                  type="monotone"
+                  dataKey="kospi"
+                  stroke={C.textFaint}
+                  strokeWidth={1.5}
+                  strokeDasharray="3 3"
+                  dot={false}
+                />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        </>
+      )}
+
+      {/* Footer methodology note */}
+      <div
+        style={{
+          marginTop: 16,
+          fontSize: 10.5,
+          color: C.textFaint,
+          lineHeight: 1.6,
+        }}
+      >
+        모델: RandomForest + 가격·거래량(P) · 검증: Purged Expanding
+        Walk-Forward + 2025 Temporal Test + 2026 Stress Test · T+10은 T+20
+        경로의 절반을 이미 관찰한 시점으로 상한 참고용입니다.
+      </div>
+    </div>
+  );
+}
+ 
